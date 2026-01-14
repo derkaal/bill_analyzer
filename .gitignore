@@ -1,0 +1,30 @@
+# User data directories
+new/
+archive/
+
+# Excel tracking file (contains user data)
+*.xlsx
+
+# Extraction log file
+extraction_log.txt
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
