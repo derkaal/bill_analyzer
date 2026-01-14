@@ -168,8 +168,13 @@ The Category column includes a dropdown with common German expense types:
 1. **Text Extraction**: Uses `pdfplumber` to extract text from PDF
 2. **Pattern Matching**: Identifies German invoice fields using regex patterns
 3. **Vendor Detection**: Finds company names (looks for GmbH, AG, etc.)
-4. **Amount Extraction**: Parses German currency format (1.234,56 €)
-5. **Validation**: Checks if Net + VAT = Gross
+4. **Smart Amount Extraction**: Uses keyword-based context search
+   - **Gross Total**: Searches near keywords like "SUMME EUR", "BRUTTO", "Gesamtbetrag"
+   - **Net Amount**: Searches near keywords like "NETTO", "Nettobetrag", "Summe Netto"
+   - **VAT Amount**: Searches near keywords like "MwSt", "Mehrwertsteuer", "USt"
+   - This prevents accidentally extracting line item prices instead of totals
+   - Fallback to largest amount if keyword search fails (marked as UNCERTAIN)
+5. **Validation**: Checks if Net + VAT ≈ Gross (tolerance: €0.02)
 6. **Quality Assessment**: Assigns confidence level to extraction
 
 ### Vendor Name Sanitization

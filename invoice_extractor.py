@@ -193,6 +193,63 @@ def extract_vendor_name(text: str) -> Optional[str]:
     return None
 
 
+def extract_amount_near_keyword(text: str, keywords: List[str], context_window: int = 100) -> Optional[float]:
+    """
+    Extract currency amount near specific keywords.
+    Looks for the first currency amount within context_window characters after keyword.
+    """
+    text_upper = text.upper()
+
+    for keyword in keywords:
+        keyword_upper = keyword.upper()
+        pos = text_upper.find(keyword_upper)
+
+        if pos != -1:
+            # Extract text window after keyword
+            context = text[pos:pos + context_window]
+
+            # Find first currency amount in this context
+            match = PATTERNS['currency'].search(context)
+            if match:
+                amount = parse_german_currency(match.group(1))
+                if amount and amount > 0:
+                    return amount
+
+    return None
+
+
+def extract_amounts_with_context(text: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    Extract Net, VAT, and Gross amounts using keyword-based context search.
+    Returns: (net, vat_amount, gross)
+    """
+    # Keywords for gross total (most important)
+    gross_keywords = [
+        'SUMME EUR', 'BRUTTO', 'Gesamtbetrag', 'Total EUR', 'Gesamt',
+        'TOTAL', 'Rechnungsbetrag', 'Endbetrag', 'Betrag gesamt',
+        'Gesamtsumme', 'Rechnungssumme'
+    ]
+
+    # Keywords for net amount
+    net_keywords = [
+        'NETTO', 'Nettobetrag', 'Summe Netto', 'NETTO-WARENWERT',
+        'Zwischensumme', 'Warenwert', 'Netto-Betrag', 'Nettopreis'
+    ]
+
+    # Keywords for VAT amount
+    vat_keywords = [
+        'MWST', 'MwSt', 'Mehrwertsteuer', 'USt', 'Umsatzsteuer',
+        'MwSt.-Betrag', 'Steuer', 'VAT'
+    ]
+
+    # Extract each amount type
+    gross = extract_amount_near_keyword(text, gross_keywords, context_window=150)
+    net = extract_amount_near_keyword(text, net_keywords, context_window=150)
+    vat_amount = extract_amount_near_keyword(text, vat_keywords, context_window=150)
+
+    return net, vat_amount, gross
+
+
 def extract_invoice_data(pdf_path: Path) -> Dict:
     """
     Extract tax-relevant data from PDF invoice.
@@ -262,61 +319,62 @@ def extract_invoice_data(pdf_path: Path) -> Dict:
                 data['vat_rate'] = '19%'
                 data['notes'] += 'VAT rate assumed 19%; '
 
-            # Extract currency amounts
-            amounts = []
-            for match in PATTERNS['currency'].finditer(text):
-                amount = parse_german_currency(match.group(1))
-                if amount and amount > 0:
-                    amounts.append(amount)
+            # Extract amounts using keyword-based context search (PRIORITY METHOD)
+            # This prevents extraction of line item prices instead of totals
+            net, vat_amount, gross = extract_amounts_with_context(text)
 
-            # Sort amounts to identify likely net/vat/gross
-            amounts = sorted(set(amounts))
+            data['net'] = net
+            data['vat_amount'] = vat_amount
+            data['gross'] = gross
 
-            if len(amounts) >= 3:
-                # Likely: smallest amounts first, gross is largest
-                data['gross'] = amounts[-1]
+            # If keyword-based extraction failed, try fallback method
+            if not gross:
+                # Fallback: collect all amounts and use largest as gross
+                amounts = []
+                for match in PATTERNS['currency'].finditer(text):
+                    amount = parse_german_currency(match.group(1))
+                    if amount and amount > 0:
+                        amounts.append(amount)
 
-                # Try to find VAT rate to calculate net
+                amounts = sorted(set(amounts))
+
+                if amounts:
+                    data['gross'] = amounts[-1]
+                    data['extraction_status'] = 'UNCERTAIN'
+                    data['notes'] += 'Gross extracted without keyword context; '
+
+            # Try to calculate missing values if we have gross
+            if data['gross'] and (not data['net'] or not data['vat_amount']):
                 vat_rate_num = 19  # default
                 if data['vat_rate']:
                     vat_rate_num = int(data['vat_rate'].replace('%', ''))
 
-                # Calculate expected net from gross
-                expected_net = data['gross'] / (1 + vat_rate_num / 100)
-
-                # Find closest amount to expected net
-                for amt in amounts:
-                    if abs(amt - expected_net) < expected_net * 0.1:  # Within 10%
-                        data['net'] = amt
-                        data['vat_amount'] = data['gross'] - data['net']
-                        break
-
                 if not data['net']:
-                    # Fallback: assume amounts[-2] is net
-                    data['net'] = amounts[-2] if len(amounts) >= 2 else None
-                    if data['net']:
-                        data['vat_amount'] = data['gross'] - data['net']
+                    # Calculate net from gross and VAT rate
+                    data['net'] = data['gross'] / (1 + vat_rate_num / 100)
+                    data['extraction_status'] = 'UNCERTAIN'
+                    data['notes'] += 'Net calculated from gross; '
 
-            elif len(amounts) == 1:
-                # Only one amount found, assume it's gross
-                data['gross'] = amounts[0]
-                vat_rate_num = 19
-                if data['vat_rate']:
-                    vat_rate_num = int(data['vat_rate'].replace('%', ''))
-                data['net'] = data['gross'] / (1 + vat_rate_num / 100)
-                data['vat_amount'] = data['gross'] - data['net']
-                data['extraction_status'] = 'UNCERTAIN'
-                data['notes'] += 'Only one amount found, calculated net/VAT; '
+                if not data['vat_amount']:
+                    # Calculate VAT amount
+                    data['vat_amount'] = data['gross'] - data['net']
 
-            # Validate amounts
+            # Validate amounts: Net + VAT ≈ Gross (tolerance: €0.02)
             if data['net'] and data['vat_amount'] and data['gross']:
                 calculated_gross = data['net'] + data['vat_amount']
-                if abs(calculated_gross - data['gross']) > 0.01:
+                if abs(calculated_gross - data['gross']) > 0.02:
+                    # Validation failed - log all values for manual review
                     data['extraction_status'] = 'UNCERTAIN'
-                    data['notes'] += 'Amount validation failed; '
+                    data['notes'] += f'Validation failed (Net:{data["net"]:.2f} + VAT:{data["vat_amount"]:.2f} ≠ Gross:{data["gross"]:.2f}); '
             else:
-                data['extraction_status'] = 'MANUAL_REVIEW_NEEDED'
-                data['notes'] += 'Missing amount data; '
+                # Missing critical amount data
+                if not data['gross']:
+                    data['extraction_status'] = 'MANUAL_REVIEW_NEEDED'
+                    data['notes'] += 'Gross amount not found; '
+                else:
+                    # We have gross but calculated net/vat - mark as uncertain
+                    if data['extraction_status'] == 'OK':
+                        data['extraction_status'] = 'UNCERTAIN'
 
     except Exception as e:
         data['extraction_status'] = 'MANUAL_REVIEW_NEEDED'
